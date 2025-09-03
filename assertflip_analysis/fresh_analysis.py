@@ -66,8 +66,8 @@ class Func(BaseModel):
     module: str | None
     func: str
 
-    def __repr__(self):
-        return f"{self.file}:{self.func}"
+    def __str__(self):
+        return f"{self.module}.{self.func}"
 
     def __eq__(self, other):
         return self.file == other.file and self.func == other.func
@@ -99,9 +99,18 @@ class Stack(BaseModel):
     def __len__(self) -> int:
         return len(self.calls)
 
+    def __hash__(self) -> int:
+        return hash(tuple(self.calls))
+
 
 class Graph(BaseModel):
     edges: Sequence[Edge]
+
+    def __iter__(self) -> Iterator[Edge]:
+        return iter(self.edges)
+
+    def __len__(self) -> int:
+        return len(self.edges)
 
 
 class ReconstructCallstacks:
@@ -150,15 +159,6 @@ class ReconstructCallstacks:
 
 
 def filter_stack(stack: Stack) -> Stack:
-    def is_relevant(file: str) -> bool:
-        return (
-            "/tests/" not in file
-            and "/site-packages/" not in file
-            and "miniconda" not in file
-            and "/root/trace.py" not in file
-            and "<frozen importlib" not in file
-        )
-
     return Stack(
         calls=[
             Call(
@@ -171,8 +171,18 @@ def filter_stack(stack: Stack) -> Stack:
                 line=call.line,
             )
             for call in stack.calls
-            if is_relevant(call.callee.file)
+            if is_relevant_file(call.callee.file)
         ]
+    )
+
+
+def is_relevant_file(file: str) -> bool:
+    return (
+        "/tests/" not in file
+        and "/site-packages/" not in file
+        and "miniconda" not in file
+        and "/root/trace.py" not in file
+        and "<frozen importlib" not in file
     )
 
 
@@ -256,6 +266,12 @@ def process_graph_b64(
     graph = decode_object(b64_str, Graph)
     assert isinstance(graph, Graph)
 
+    # dump clean graph
+    clean_edges = [e for e in graph if is_relevant_file(e.callee.file)]
+    lines = (f"{e.file},{e.line},{e.callee!s},{e.depth}\n" for e in clean_edges)
+    with timeblock("compute & dump lines"), open(out_dir / "clean.trace.csv", "w") as f:
+        f.writelines(lines)
+
     # reconstruct stacks from call graph
     stacks = list(ReconstructCallstacks.run(graph.edges))
     logger.info("found {} stacks", len(stacks))
@@ -297,7 +313,9 @@ def process_graph_b64(
         return any(dev_f == call.callee for dev_f, call in product(dev_funcs, stack))
 
     relevant_stacks = list(filter(is_relevant, clean_stacks))
-    logger.info("found {} relevant clean stacks", len(relevant_stacks))
+    logger.info("found {} relevant clean stacks before dedup", len(relevant_stacks))
+    relevant_stacks = list(dict.fromkeys(relevant_stacks))
+    logger.info("found {} relevant clean stacks after dedup", len(relevant_stacks))
 
     with (
         open(out_dir / "relevant.clean.stacks.b64l", "w") as f,
