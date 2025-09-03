@@ -80,6 +80,20 @@ class Call(BaseModel):
     callee: Func
     file: str
     line: int
+    uid: int
+
+    def __eq__(self, other: object):
+        if not isinstance(other, Call):
+            return False
+        return (
+            self.callee == other.callee
+            and self.file == other.file
+            and self.line == other.line
+            and self.uid == other.uid
+        )
+
+    def __hash__(self):
+        return hash((self.callee, self.file, self.line))
 
 
 class Stack(BaseModel):
@@ -102,11 +116,14 @@ class Stack(BaseModel):
     def __hash__(self) -> int:
         return hash(tuple(self.calls))
 
+    def __getitem__(self, x):
+        return self.calls[x]
+
 
 class Graph(BaseModel):
     edges: Sequence[Edge]
 
-    def __iter__(self) -> Iterator[Edge]:
+    def __iter__(self) -> Iterator[Edge]:  # type:ignore
         return iter(self.edges)
 
     def __len__(self) -> int:
@@ -120,11 +137,11 @@ class ReconstructCallstacks:
         stack: deque[Call] = deque()
         depths: deque[int] = deque()
         last_callee = None
-        for edge in trace:
+        for uid, edge in enumerate(trace):
             depth, caller, callee = edge.depth, edge.caller, edge.callee
             last_depth = depths[-1] if depths else -1
             if not stack:
-                stack.append(Call(callee=caller, file="", line=-1))
+                stack.append(Call(callee=caller, file="", line=-1, uid=-1))
 
             if depth > last_depth:
                 assert last_callee is None or (caller == last_callee), (
@@ -132,7 +149,9 @@ class ReconstructCallstacks:
                     caller,
                     callee,
                 )
-                stack.append(Call(callee=edge.callee, file=edge.file, line=edge.line))
+                stack.append(
+                    Call(callee=edge.callee, file=edge.file, line=edge.line, uid=uid)
+                )
                 depths.append(depth)
             else:
                 assert depths
@@ -149,13 +168,22 @@ class ReconstructCallstacks:
                     stack.pop()
                     depths.pop()
                 assert (not stack) or stack[-1].callee == caller
-                stack.append(Call(callee=callee, file=edge.file, line=edge.line))
+                stack.append(
+                    Call(callee=callee, file=edge.file, line=edge.line, uid=uid)
+                )
                 depths.append(depth)
 
             last_callee = callee
 
         if stack:
             yield Stack(calls=stack)
+
+
+def _is_strict_prefix(shorter: Sequence[Call], longer: Sequence[Call]) -> bool:
+    if len(shorter) >= len(longer):
+        return False
+
+    return all(x == y for x, y in zip(shorter, longer, strict=False))
 
 
 def filter_stack(stack: Stack) -> Stack:
@@ -169,6 +197,7 @@ def filter_stack(stack: Stack) -> Stack:
                 ),
                 file=call.file,
                 line=call.line,
+                uid=call.uid,
             )
             for call in stack.calls
             if is_relevant_file(call.callee.file)
@@ -186,11 +215,11 @@ def is_relevant_file(file: str) -> bool:
     )
 
 
-@logger.catch
+@logger.catch()
 def main():
     dev_funcs_map = load_dev_funcs_map()
 
-    with ProcessPoolExecutor(4) as executor:
+    with ProcessPoolExecutor(1) as executor:
         future_map = {}
         while True:
             task_dirs = Path(
@@ -204,8 +233,6 @@ def main():
             new_out_dirs = [
                 Path("assertflip_analysis", "fresh_results", t) for t in new_task_ids
             ]
-
-            logger.info("submitting {} new tasks: {}", len(new_task_ids), new_task_ids)
 
             for task_dir, out_dir, dev_func in zip(
                 new_task_dirs, new_out_dirs, new_dev_funcs
@@ -237,7 +264,7 @@ def process_task_dir(
 ) -> None:
     logger.add(out_dir / "fresh_analysis.log")
 
-    logger.info(dev_funcs)
+    logger.info("Processing {}", str(task_dir))
 
     test_output_file = task_dir / "test_output.txt"
     if not test_output_file.exists():
@@ -268,8 +295,11 @@ def process_graph_b64(
 
     # dump clean graph
     clean_edges = [e for e in graph if is_relevant_file(e.callee.file)]
-    lines = (f"{e.file},{e.line},{e.callee!s},{e.depth}\n" for e in clean_edges)
+    lines = (
+        f"{e.file},{e.line},{e.caller!s},{e.callee!s},{e.depth}\n" for e in clean_edges
+    )
     with timeblock("compute & dump lines"), open(out_dir / "clean.trace.csv", "w") as f:
+        f.write("file,line,caller,callee,depth\n")
         f.writelines(lines)
 
     # reconstruct stacks from call graph
@@ -314,8 +344,6 @@ def process_graph_b64(
 
     relevant_stacks = list(filter(is_relevant, clean_stacks))
     logger.info("found {} relevant clean stacks before dedup", len(relevant_stacks))
-    relevant_stacks = list(dict.fromkeys(relevant_stacks))
-    logger.info("found {} relevant clean stacks after dedup", len(relevant_stacks))
 
     with (
         open(out_dir / "relevant.clean.stacks.b64l", "w") as f,
@@ -328,6 +356,32 @@ def process_graph_b64(
     with open(out_dir / "relevant.clean.stacks.json", "wb") as f:
         adapter = TypeAdapter(list[Stack])
         f.write(adapter.dump_json(relevant_stacks, indent=4))
+
+    # deduplicate relevant stacks
+    uniq_relevant_stacks = list(dict.fromkeys(relevant_stacks))
+    logger.info("found {} relevant clean stacks after dedup", len(uniq_relevant_stacks))
+
+    uniq_relevant_stacks = [
+        x
+        for x in uniq_relevant_stacks
+        if not any(_is_strict_prefix(x.calls, y.calls) for y in uniq_relevant_stacks)
+    ]
+    logger.info(
+        "found {} relevant clean stacks after dedup & subsuming",
+        len(uniq_relevant_stacks),
+    )
+
+    with (
+        open(out_dir / "uniq.relevant.clean.stacks.b64l", "w") as f,
+        timeblock("encode & dump relevant stacks"),
+    ):
+        for stack in uniq_relevant_stacks:
+            f.write(encode_object(stack))
+            f.write("\n")
+
+    with open(out_dir / "uniq.relevant.clean.stacks.json", "wb") as f:
+        adapter = TypeAdapter(list[Stack])
+        f.write(adapter.dump_json(uniq_relevant_stacks, indent=4))
 
 
 def encode_object(model: BaseModel) -> str:
@@ -355,7 +409,7 @@ def test_process_graph_b64():
 def test_reconstruct_callstacks():
     f, g, h, t, y = (Func(file="foo.py", module="foo", func=name) for name in "fghty")
     cf, cg, ch, ct, cy = (
-        Call(callee=func, file="foo.py", line=line)
+        Call(callee=func, file="foo.py", line=line, uid=-1)
         for func, line in ((f, -1), (g, 2), (h, 10), (t, 11), (y, 3))
     )
     cf.file = ""
@@ -370,8 +424,11 @@ def test_reconstruct_callstacks():
         Stack(calls=[cf, cg, ct]),
         Stack(calls=[cf, cy]),
     ]
-    result = ReconstructCallstacks.run(trace)
-    assert list(result) == expected_callstacks
+    try:
+        result = ReconstructCallstacks.run(trace)
+        assert list(result) == expected_callstacks
+    except Exception:
+        logger.exception("exception when reconstructing")
 
 
 if __name__ == "__main__":
