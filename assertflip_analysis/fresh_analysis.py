@@ -1,4 +1,5 @@
 from __future__ import annotations
+from time import sleep
 import json
 from loguru import logger
 import orjson
@@ -179,15 +180,30 @@ def filter_stack(stack: Stack) -> Stack:
 def main():
     dev_funcs_map = load_dev_funcs_map()
 
-    task_dirs = list(
-        Path("run_instance_swt_logs/assertflip/pred_pre__AssertFlip").glob("*/")
-    )
-    task_ids = [t.name for t in task_dirs]
-    dev_funcs = [dev_funcs_map[t] for t in task_ids]
-    out_dirs = [Path("assertflip_analysis", "fresh_results", t) for t in task_ids]
-
     with ProcessPoolExecutor(4) as executor:
-        executor.map(process_task_dir, task_dirs, out_dirs, dev_funcs)
+        future_map = {}
+        while True:
+            task_dirs = Path(
+                "run_instance_swt_logs/assertflip/pred_pre__AssertFlip"
+            ).glob("*/")
+            task_dirs = [t for t in task_dirs if t.joinpath("test_output.txt").exists()]
+
+            new_task_dirs = sorted(set(task_dirs) - set(future_map))
+            new_task_ids = [t.name for t in new_task_dirs]
+            new_dev_funcs = [dev_funcs_map.get(t) for t in new_task_ids]
+            new_out_dirs = [
+                Path("assertflip_analysis", "fresh_results", t) for t in new_task_ids
+            ]
+
+            logger.info("submitting {} new tasks: {}", len(new_task_ids), new_task_ids)
+
+            for task_dir, out_dir, dev_func in zip(
+                new_task_dirs, new_out_dirs, new_dev_funcs
+            ):
+                future = executor.submit(process_task_dir, task_dir, out_dir, dev_func)
+                future_map[task_dir] = future
+
+            sleep(10)
 
 
 def load_dev_funcs_map() -> dict[str, set[Func]]:
@@ -206,7 +222,9 @@ def load_dev_funcs_map() -> dict[str, set[Func]]:
     return {k: set(map(dev_loc_to_func, v)) for k, v in dev_locs_map.items()}
 
 
-def process_task_dir(task_dir: Path, out_dir: Path, dev_funcs: set[Func]) -> None:
+def process_task_dir(
+    task_dir: Path, out_dir: Path, dev_funcs: set[Func] | None = None
+) -> None:
     logger.add(out_dir / "fresh_analysis.log")
 
     logger.info(dev_funcs)
@@ -271,6 +289,9 @@ def process_graph_b64(
             f.write("\n")
 
     dev_funcs = dev_funcs or set()
+    if not dev_funcs:
+        logger.warning("no dev funcs found; exiting")
+        raise SystemExit
 
     def is_relevant(stack: Stack) -> bool:
         return any(dev_f == call.callee for dev_f, call in product(dev_funcs, stack))
