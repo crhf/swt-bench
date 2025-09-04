@@ -13,6 +13,7 @@ from argparse import ArgumentParser
 
 from collections import ChainMap
 from concurrent.futures import ProcessPoolExecutor
+from os.path import join
 import base64
 from io import TextIOBase
 import gzip
@@ -230,6 +231,8 @@ def main():
 
     dev_funcs_map = load_dev_funcs_map()
 
+    logger.add(join(args.out_dir, "fresh_analysis.log"))
+
     with ProcessPoolExecutor(8) as executor:
         future_map = {}
         while True:
@@ -271,22 +274,26 @@ def load_dev_funcs_map() -> dict[str, set[Func]]:
 def process_task_dir(
     task_dir: Path, out_dir: Path, dev_funcs: set[Func] | None = None
 ) -> None:
-    logger.add(out_dir / "fresh_analysis.log")
+    logger.add(
+        out_dir / "fresh_analysis.log",
+        filter=lambda record: record["extra"].get("task_dir") == task_dir,
+    )
 
     logger.info("Processing {}", str(task_dir))
 
-    test_output_file = task_dir / "test_output.txt"
-    if not test_output_file.exists():
-        logger.error("test output file not found")
-        return
+    with logger.contextualize(task_dir=task_dir):
+        test_output_file = task_dir / "test_output.txt"
+        if not test_output_file.exists():
+            logger.error("test output file not found")
+            return
 
-    with timeblock("extract graph b64 from log"), open(test_output_file) as f:
-        b64 = extract_graph_b64(f)
+        with timeblock("extract graph b64 from log"), open(test_output_file) as f:
+            b64 = extract_graph_b64(f)
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_dir.joinpath("graph.b64").write_text(b64)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_dir.joinpath("graph.b64").write_text(b64)
 
-    process_graph_b64(b64, out_dir, dev_funcs)
+        process_graph_b64(b64, out_dir, dev_funcs)
 
 
 def extract_graph_b64(f: TextIOBase) -> str:
@@ -300,7 +307,7 @@ def process_graph_b64(
     b64_str: str,
     out_dir: Path,
     dev_funcs: set[Func] | None = None,
-    dedup_before_finding_relevant: bool = False,
+    dedup_before_finding_relevant: bool = True,
 ) -> None:
     graph = decode_object(b64_str, Graph)
     assert isinstance(graph, Graph)
@@ -343,14 +350,18 @@ def process_graph_b64(
             f.write("\n")
 
     if dedup_before_finding_relevant:
-        # deduplicate stacks, also remove stacks that are a prefix of another stack
+        # deduplicate stacks, also remove stacks that are a prefix of another stack.
+        # 100k+ clean stacks, need to use trie to speed up.
+        # Use uid instead of the Call objects for deduplication, to reduce hashing cost.
+        uid2call = {call.uid: call for stack in clean_stacks for call in stack.calls}
         with timeblock("deduplicate stacks"):
-            # 100k+ clean stacks, need to use trie to speed up.
-            # takes several minutes
-            uniq_call_sequences = remove_prefixes_and_duplicates(
-                stack.calls for stack in clean_stacks
+            uid_sequences = (
+                (call.uid for call in stack.calls) for stack in clean_stacks
             )
-        clean_stacks = [Stack(calls=seq) for seq in uniq_call_sequences]
+            uniq_uid_sequences = remove_prefixes_and_duplicates(uid_sequences)
+        clean_stacks = [
+            Stack(calls=[uid2call[uid] for uid in seq]) for seq in uniq_uid_sequences
+        ]
         logger.info("found {} unique clean stacks", len(clean_stacks))
         with (
             timeblock("encode unique clean stacks"),
@@ -402,6 +413,8 @@ def process_graph_b64(
             "found {} relevant clean stacks after dedup", len(uniq_relevant_stacks)
         )
 
+        # brute-forcing here, since there is only a couple relevant stacks.
+        # Can switch to trie tree if necessary.
         uniq_relevant_stacks = [
             x
             for x in uniq_relevant_stacks
@@ -445,7 +458,7 @@ def decode_object(b64_str: str, model_type: type[BaseModel] | None = None):
 
 
 @timethis
-def remove_prefixes_and_duplicates(call_lists: Iterable[Sequence[T]]) -> list[list[T]]:
+def remove_prefixes_and_duplicates(call_lists: Iterable[Iterable[T]]) -> list[list[T]]:
     if not call_lists:
         return []
 
