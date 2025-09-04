@@ -4,9 +4,13 @@ import json
 from loguru import logger
 import orjson
 from collections.abc import Iterable
+from tqdm import tqdm
 from contextlib import contextmanager
 from pydantic import TypeAdapter
+import networkx as nx
 from itertools import product
+from argparse import ArgumentParser
+
 from collections import ChainMap
 from concurrent.futures import ProcessPoolExecutor
 import base64
@@ -24,6 +28,9 @@ from pydantic import BaseModel
 
 import time
 from functools import wraps
+from typing import TypeVar
+
+T = TypeVar("T")
 
 
 def timethis(func):
@@ -217,9 +224,13 @@ def is_relevant_file(file: str) -> bool:
 
 @logger.catch()
 def main():
+    parser = ArgumentParser()
+    parser.add_argument("--out-dir", "-o", type=Path, required=True)
+    args = parser.parse_args()
+
     dev_funcs_map = load_dev_funcs_map()
 
-    with ProcessPoolExecutor(1) as executor:
+    with ProcessPoolExecutor(8) as executor:
         future_map = {}
         while True:
             task_dirs = Path(
@@ -230,9 +241,7 @@ def main():
             new_task_dirs = sorted(set(task_dirs) - set(future_map))
             new_task_ids = [t.name for t in new_task_dirs]
             new_dev_funcs = [dev_funcs_map.get(t) for t in new_task_ids]
-            new_out_dirs = [
-                Path("assertflip_analysis", "fresh_results", t) for t in new_task_ids
-            ]
+            new_out_dirs = [Path(args.out_dir, t) for t in new_task_ids]
 
             for task_dir, out_dir, dev_func in zip(
                 new_task_dirs, new_out_dirs, new_dev_funcs
@@ -271,7 +280,7 @@ def process_task_dir(
         logger.error("test output file not found")
         return
 
-    with open(test_output_file) as f, timeblock("extract graph b64 from log"):
+    with timeblock("extract graph b64 from log"), open(test_output_file) as f:
         b64 = extract_graph_b64(f)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -288,7 +297,10 @@ def extract_graph_b64(f: TextIOBase) -> str:
 
 
 def process_graph_b64(
-    b64_str: str, out_dir: Path, dev_funcs: set[Func] | None = None
+    b64_str: str,
+    out_dir: Path,
+    dev_funcs: set[Func] | None = None,
+    dedup_before_finding_relevant: bool = False,
 ) -> None:
     graph = decode_object(b64_str, Graph)
     assert isinstance(graph, Graph)
@@ -298,7 +310,10 @@ def process_graph_b64(
     lines = (
         f"{e.file},{e.line},{e.caller!s},{e.callee!s},{e.depth}\n" for e in clean_edges
     )
-    with timeblock("compute & dump lines"), open(out_dir / "clean.trace.csv", "w") as f:
+    with (
+        timeblock("compute & dump traces"),
+        open(out_dir / "clean.trace.csv", "w") as f,
+    ):
         f.write("file,line,caller,callee,depth\n")
         f.writelines(lines)
 
@@ -307,81 +322,109 @@ def process_graph_b64(
     logger.info("found {} stacks", len(stacks))
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "stacks.b64l", "w") as f:
-        with ProcessPoolExecutor(10) as executor, timeblock("encode stacks"):
-            stack_strings = list(executor.map(encode_object, stacks, chunksize=1000))
-
-        with timeblock("write stacks"):
-            for s in stack_strings:
-                f.write(s)
-                f.write("\n")
+    with timeblock("encode stacks"), ProcessPoolExecutor(10) as executor:
+        stack_strings = list(executor.map(encode_object, stacks, chunksize=1000))
+    with timeblock("write stacks"), open(out_dir / "stacks.b64l", "w") as f:
+        for s in stack_strings:
+            f.write(s)
+            f.write("\n")
 
     # remove irrelevant functions from stacks
     clean_stacks = map(filter_stack, stacks)
     clean_stacks = filter(None, clean_stacks)
     with timeblock("filter stacks"):
         clean_stacks = list(clean_stacks)
-
     logger.info("found {} clean stacks", len(clean_stacks))
-
-    with open(out_dir / "clean.stacks.b64l", "w") as f:
-        with ProcessPoolExecutor(10) as executor, timeblock("encode clean stacks"):
-            stack_strings = list(
-                executor.map(encode_object, clean_stacks, chunksize=1000)
-            )
-
+    with timeblock("encode clean stacks"), ProcessPoolExecutor(10) as executor:
+        stack_strings = list(executor.map(encode_object, clean_stacks, chunksize=1000))
+    with timeblock("write clean stacks"), open(out_dir / "clean.stacks.b64l", "w") as f:
         for s in stack_strings:
             f.write(s)
             f.write("\n")
 
+    if dedup_before_finding_relevant:
+        # deduplicate stacks, also remove stacks that are a prefix of another stack
+        with timeblock("deduplicate stacks"):
+            # 100k+ clean stacks, need to use trie to speed up.
+            # takes several minutes
+            uniq_call_sequences = remove_prefixes_and_duplicates(
+                stack.calls for stack in clean_stacks
+            )
+        clean_stacks = [Stack(calls=seq) for seq in uniq_call_sequences]
+        logger.info("found {} unique clean stacks", len(clean_stacks))
+        with (
+            timeblock("encode unique clean stacks"),
+            ProcessPoolExecutor(10) as executor,
+        ):
+            stack_strings = list(
+                executor.map(encode_object, clean_stacks, chunksize=100)
+            )
+        with (
+            timeblock("write unique clean stacks"),
+            open(out_dir / "uniq.clean.stacks.b64l", "w") as f,
+        ):
+            for s in stack_strings:
+                f.write(s)
+                f.write("\n")
+
     dev_funcs = dev_funcs or set()
     if not dev_funcs:
         logger.warning("no dev funcs found; exiting")
-        raise SystemExit
+        return
 
     def is_relevant(stack: Stack) -> bool:
         return any(dev_f == call.callee for dev_f, call in product(dev_funcs, stack))
 
     relevant_stacks = list(filter(is_relevant, clean_stacks))
-    logger.info("found {} relevant clean stacks before dedup", len(relevant_stacks))
+    logger.info("found {} relevant unique clean stacks", len(relevant_stacks))
 
+    stem = (
+        "relevant.uniq.clean.stacks"
+        if dedup_before_finding_relevant
+        else "relevant.clean.stacks"
+    )
     with (
-        open(out_dir / "relevant.clean.stacks.b64l", "w") as f,
         timeblock("encode & dump relevant stacks"),
+        open(out_dir / f"{stem}.b64l", "w") as f,
     ):
         for stack in relevant_stacks:
             f.write(encode_object(stack))
             f.write("\n")
 
-    with open(out_dir / "relevant.clean.stacks.json", "wb") as f:
+    with open(out_dir / f"{stem}.json", "wb") as f:
         adapter = TypeAdapter(list[Stack])
         f.write(adapter.dump_json(relevant_stacks, indent=4))
 
     # deduplicate relevant stacks
-    uniq_relevant_stacks = list(dict.fromkeys(relevant_stacks))
-    logger.info("found {} relevant clean stacks after dedup", len(uniq_relevant_stacks))
+    if not dedup_before_finding_relevant:
+        uniq_relevant_stacks = list(dict.fromkeys(relevant_stacks))
+        logger.info(
+            "found {} relevant clean stacks after dedup", len(uniq_relevant_stacks)
+        )
 
-    uniq_relevant_stacks = [
-        x
-        for x in uniq_relevant_stacks
-        if not any(_is_strict_prefix(x.calls, y.calls) for y in uniq_relevant_stacks)
-    ]
-    logger.info(
-        "found {} relevant clean stacks after dedup & subsuming",
-        len(uniq_relevant_stacks),
-    )
+        uniq_relevant_stacks = [
+            x
+            for x in uniq_relevant_stacks
+            if not any(
+                _is_strict_prefix(x.calls, y.calls) for y in uniq_relevant_stacks
+            )
+        ]
+        logger.info(
+            "found {} relevant clean stacks after dedup & subsuming",
+            len(uniq_relevant_stacks),
+        )
 
-    with (
-        open(out_dir / "uniq.relevant.clean.stacks.b64l", "w") as f,
-        timeblock("encode & dump relevant stacks"),
-    ):
-        for stack in uniq_relevant_stacks:
-            f.write(encode_object(stack))
-            f.write("\n")
+        with (
+            open(out_dir / "uniq.relevant.clean.stacks.b64l", "w") as f,
+            timeblock("encode & dump relevant stacks"),
+        ):
+            for stack in uniq_relevant_stacks:
+                f.write(encode_object(stack))
+                f.write("\n")
 
-    with open(out_dir / "uniq.relevant.clean.stacks.json", "wb") as f:
-        adapter = TypeAdapter(list[Stack])
-        f.write(adapter.dump_json(uniq_relevant_stacks, indent=4))
+        with open(out_dir / "uniq.relevant.clean.stacks.json", "wb") as f:
+            adapter = TypeAdapter(list[Stack])
+            f.write(adapter.dump_json(uniq_relevant_stacks, indent=4))
 
 
 def encode_object(model: BaseModel) -> str:
@@ -399,6 +442,44 @@ def decode_object(b64_str: str, model_type: type[BaseModel] | None = None):
         return model_type.model_validate_json(json_bytes.decode("utf-8"))
     else:
         return orjson.loads(json_bytes)
+
+
+@timethis
+def remove_prefixes_and_duplicates(call_lists: Iterable[Sequence[T]]) -> list[list[T]]:
+    if not call_lists:
+        return []
+
+    G = nx.DiGraph()
+
+    root = object()
+    G.add_node(root)
+
+    logger.info("start building trie")
+    # build trie tree
+    with timeblock("build trie"):
+        for call_list in call_lists:
+            prev_node = root
+            for call in call_list:
+                G.add_node(call)
+                G.add_edge(prev_node, call)
+                prev_node = call
+
+    # get all paths to leaf nodes
+    leaves = [node for node in G.nodes() if G.out_degree(node) == 0 and node != root]
+    paths = []
+    with timeblock("walking trie"):
+        for leaf in tqdm(leaves, desc="trie leaves"):
+            path = []
+            current = leaf
+            while current is not root:
+                path.append(current)
+                parents = G.pred[current]
+                # trie built from call stacks must be a tree
+                assert len(parents) == 1, (current, parents)
+                [current] = parents
+            path.reverse()
+            paths.append(path)
+    return paths
 
 
 def test_process_graph_b64():
@@ -429,6 +510,14 @@ def test_reconstruct_callstacks():
         assert list(result) == expected_callstacks
     except Exception:
         logger.exception("exception when reconstructing")
+
+
+def test_remove_prefixes_and_duplicates():
+    lists = [[1, 2, 3], [1, 2, 3], [1, 2], [4, 5, 6, 8], [4, 5, 6]]
+    assert sorted(remove_prefixes_and_duplicates(lists)) == [
+        [1, 2, 3],
+        [4, 5, 6, 8],
+    ]
 
 
 if __name__ == "__main__":
